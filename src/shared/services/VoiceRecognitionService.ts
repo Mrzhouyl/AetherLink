@@ -1,140 +1,144 @@
 import { SpeechRecognition } from '@capacitor-community/speech-recognition';
+import { Capacitor } from '@capacitor/core';
 import { getStorageItem, setStorageItem } from '../utils/storage';
-import type {
-  SpeechRecognitionOptions,
-  SpeechRecognitionPermissions,
-} from '../types/voice';
+import type { SpeechRecognitionOptions, SpeechRecognitionPermissions } from '../types/voice';
 import { openAIWhisperService } from './OpenAIWhisperService';
 
-/**
- * 语音识别服务类，支持多种提供者
- */
+// 语音识别服务（Capacitor 原生 + Web Speech Fallback + OpenAI Whisper）
 class VoiceRecognitionService {
   private static instance: VoiceRecognitionService;
-  private isListening: boolean = false;
+  private isListening = false;
   private partialResultsCallback: ((text: string) => void) | null = null;
   private errorCallback: ((error: any) => void) | null = null;
   private listeningStateCallback: ((state: 'started' | 'stopped') => void) | null = null;
-  private provider: 'capacitor' | 'openai' = 'capacitor'; // 默认使用Capacitor
-  private recordingDuration: number = 5000; // OpenAI Whisper录音时长(毫秒)
+  private provider: 'capacitor' | 'openai' = 'capacitor';
+  private recordingDuration = 5000;
   private recordingTimeoutId: number | null = null;
   private recordingStream: MediaStream | null = null;
   private mediaRecorder: MediaRecorder | null = null;
   private audioChunks: BlobPart[] = [];
-  private isWebEnvironment: boolean = false; // 是否在Web环境中
-  private webSpeechRecognition: SpeechRecognition | null = null; // Web Speech API 实例
+  private isWebEnvironment = false;
+  private webSpeechRecognition: any | null = null; // Web Speech API 实例
+  private webRecognitionStarting = false; // Web 启动中标记
+  private forcedEnvironment: 'auto' | 'web' | 'native' = 'auto'; // 手动覆盖环境
+
+  /** 手动覆盖环境: 'web' 强制使用 Web Speech, 'native' 强制使用 Capacitor 原生, 'auto' 自动判定 */
+  public setEnvironmentOverride(mode: 'auto' | 'web' | 'native') {
+    this.forcedEnvironment = mode;
+    this.detectEnvironment(true);
+  }
+
+  /** 当前是否被强制为 Web */
+  public getEnvironmentOverride() { return this.forcedEnvironment; }
+
+  /** 重新判定环境（供外部调试） */
+  public reDetectEnvironment() { this.detectEnvironment(true); }
 
   private constructor() {
-    // 检测是否在Web环境中 - 强制在浏览器中使用Web API
-    const hasWindow = typeof window !== 'undefined';
-    const isInBrowser = hasWindow && typeof navigator !== 'undefined' && !!navigator.userAgent;
-    this.isWebEnvironment = isInBrowser;
+    this.detectEnvironment(false);
+    this.debugLog('[INIT] forcedEnvironment =', this.forcedEnvironment, 'isWebEnvironment =', this.isWebEnvironment);
 
-
-
-    // 初始化Web Speech API (如果在Web环境且浏览器支持)
-    if (this.isWebEnvironment && (window.SpeechRecognition || window.webkitSpeechRecognition)) {
-      const SpeechRecognitionAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
+    // 初始化 Web Speech API（仅纯浏览器环境）
+  if (this.isWebEnvironment && (window.SpeechRecognition || (window as any).webkitSpeechRecognition)) {
+      const SpeechRecognitionAPI = window.SpeechRecognition || (window as any).webkitSpeechRecognition;
       this.webSpeechRecognition = new SpeechRecognitionAPI();
+      this.webSpeechRecognition.continuous = true;
+      this.webSpeechRecognition.interimResults = true;
 
-      if (this.webSpeechRecognition) {
-        this.webSpeechRecognition.continuous = true;
-        this.webSpeechRecognition.interimResults = true;
-
-        this.webSpeechRecognition.onresult = (event) => {
-          if (this.provider !== 'capacitor') return;
-
-          const result = event.results[event.results.length - 1];
-          if (result.isFinal && this.partialResultsCallback) {
-            this.partialResultsCallback(result[0].transcript);
-          } else if (this.partialResultsCallback) {
-            this.partialResultsCallback(result[0].transcript);
-          }
-        };
-
-        this.webSpeechRecognition.onend = () => {
-          if (this.provider !== 'capacitor') return;
-
-          this.isListening = false;
-          if (this.listeningStateCallback) {
-            this.listeningStateCallback('stopped');
-          }
-        };
-
-        this.webSpeechRecognition.onerror = (event) => {
-          if (this.provider !== 'capacitor') return;
-
-          this.isListening = false;
-          if (this.listeningStateCallback) {
-            this.listeningStateCallback('stopped');
-          }
-          if (this.errorCallback) {
-            this.errorCallback(new Error(`语音识别错误: ${event.error}`));
-          }
-        };
-      }
+      this.webSpeechRecognition.onstart = () => {
+        this.webRecognitionStarting = false;
+        this.isListening = true;
+        this.listeningStateCallback?.('started');
+      };
+      this.webSpeechRecognition.onresult = (event: any) => {
+        if (this.provider !== 'capacitor') return;
+        const result = event.results[event.results.length - 1];
+        if (this.partialResultsCallback) this.partialResultsCallback(result[0].transcript);
+      };
+      this.webSpeechRecognition.onend = () => {
+        if (this.provider !== 'capacitor') return;
+        this.webRecognitionStarting = false;
+        this.isListening = false;
+        this.listeningStateCallback?.('stopped');
+      };
+      this.webSpeechRecognition.onerror = (event: any) => {
+        if (this.provider !== 'capacitor') return;
+        this.webRecognitionStarting = false;
+        this.isListening = false;
+        this.listeningStateCallback?.('stopped');
+        this.errorCallback?.(new Error(`语音识别错误: ${event.error}`));
+      };
     }
 
-    // 初始化时从存储加载提供者
-    this.loadProvider();
-
-    // 为Capacitor添加语音识别事件监听
+    // 仅原生环境监听 partialResults
     if (!this.isWebEnvironment) {
       SpeechRecognition.addListener('partialResults', (data: { matches: string[] }) => {
         if (this.provider !== 'capacitor') return;
-
-        if (data.matches && data.matches.length > 0 && this.partialResultsCallback) {
+        if (data.matches?.length && this.partialResultsCallback) {
           this.partialResultsCallback(data.matches[0]);
         }
       });
     }
+
+    // 异步加载持久化 provider
+    this.loadProvider();
   }
 
   /**
-   * 从存储中加载语音识别提供者
+   * 环境判定逻辑聚合
    */
+  private detectEnvironment(relog: boolean) {
+    if (this.forcedEnvironment === 'web') {
+      this.isWebEnvironment = true;
+    } else if (this.forcedEnvironment === 'native') {
+      this.isWebEnvironment = false;
+    } else {
+      // auto 模式：多信号综合
+      let nativeSignals = 0;
+      try {
+        const plat = Capacitor?.getPlatform?.();
+        if (plat && plat !== 'web') nativeSignals++;
+        if (Capacitor?.isNativePlatform?.()) nativeSignals++;
+      } catch { /* ignore */ }
+      const winCap = (globalThis as any).Capacitor;
+      if (winCap?.isNativePlatform?.()) nativeSignals++;
+      if (winCap?.getPlatform?.() && winCap.getPlatform() !== 'web') nativeSignals++;
+      // 插件存在也是信号
+      if (winCap?.plugins?.SpeechRecognition) nativeSignals++;
+      // WebView 典型 UA 标记: wv; 纯浏览器可能没有 NativeBridge
+      const hasNativeBridge = !!winCap?.NativeBridge;
+      if (hasNativeBridge) nativeSignals++;
+      // 经验：>=2 认为原生
+      this.isWebEnvironment = nativeSignals < 2;
+    }
+    if (relog) this.debugLog('[ENV-DETECT] forced=', this.forcedEnvironment, 'isWebEnvironment=', this.isWebEnvironment);
+  }
+
+  private debugLog(...args: any[]) {
+    // 可根据需要切换为条件编译 / 环境变量
+    if (typeof console !== 'undefined') console.log('[VoiceRecognitionService]', ...args);
+  }
+
   private async loadProvider() {
     try {
       const storedProvider = await getStorageItem<string>('speech_recognition_provider');
-      if (storedProvider === 'openai' || storedProvider === 'capacitor') {
-        this.provider = storedProvider;
-      }
-    } catch (error) {
-      // 静默处理错误
-    }
+      if (storedProvider === 'openai' || storedProvider === 'capacitor') this.provider = storedProvider;
+    } catch { /* ignore */ }
   }
 
-  /**
-   * 获取单例实例
-   */
   public static getInstance(): VoiceRecognitionService {
-    if (!VoiceRecognitionService.instance) {
-      VoiceRecognitionService.instance = new VoiceRecognitionService();
-    }
+    if (!VoiceRecognitionService.instance) VoiceRecognitionService.instance = new VoiceRecognitionService();
     return VoiceRecognitionService.instance;
   }
 
-  /**
-   * 设置语音识别提供者
-   */
   public async setProvider(provider: 'capacitor' | 'openai') {
-    if (this.isListening) {
-      await this.stopRecognition();
-    }
+    if (this.isListening || this.webRecognitionStarting) await this.stopRecognition();
     this.provider = provider;
     await setStorageItem('speech_recognition_provider', provider);
   }
 
-  /**
-   * 获取当前语音识别提供者
-   */
-  public getProvider(): 'capacitor' | 'openai' {
-    return this.provider;
-  }
+  public getProvider(): 'capacitor' | 'openai' { return this.provider; }
 
-  /**
-   * 检查语音识别权限
-   */
   public async checkPermissions(): Promise<SpeechRecognitionPermissions> {
     if (this.provider === 'capacitor') {
       // Web环境使用Web API
@@ -192,9 +196,7 @@ class VoiceRecognitionService {
     }
   }
 
-  /**
-   * 请求语音识别权限
-   */
+  /** 请求语音识别权限 */
   public async requestPermissions(): Promise<SpeechRecognitionPermissions> {
     if (this.provider === 'capacitor') {
       // Web环境使用Web API
@@ -233,9 +235,7 @@ class VoiceRecognitionService {
     }
   }
 
-  /**
-   * 检查语音识别是否可用
-   */
+  /** 检查语音识别是否可用 */
   public isVoiceRecognitionAvailable(): boolean {
     if (this.provider === 'capacitor') {
       if (this.isWebEnvironment) {
@@ -257,71 +257,42 @@ class VoiceRecognitionService {
     }
   }
 
-  /**
-   * 开始语音识别
-   */
   public async startRecognition(options?: SpeechRecognitionOptions): Promise<void> {
-    // 如果已经在录音，先停止
-    if (this.isListening) {
-      try {
-        await this.stopRecognition();
-        // 添加小延迟，确保之前的录音完全停止
-        await new Promise(resolve => setTimeout(resolve, 300));
-      } catch (error) {
-        // 继续尝试新的录音
-      }
+  this.debugLog('[startRecognition] provider=', this.provider, 'isWebEnvironment=', this.isWebEnvironment, 'listening=', this.isListening, 'starting=', this.webRecognitionStarting);
+  // 运行前再次确认（防止热更新或延迟加载导致状态不一致）
+  this.detectEnvironment(true);
+  this.debugLog('[startRecognition] after detect: isWebEnvironment=', this.isWebEnvironment);
+    // Web 分支重复启动保护（不调用 stop，直接忽略）
+    if (this.provider === 'capacitor' && this.isWebEnvironment) {
+      if (this.isListening || this.webRecognitionStarting) return;
+    } else if (this.isListening) {
+      // 原生/Whisper 若仍在监听则先停止
+      await this.stopRecognition();
+      await new Promise(r => setTimeout(r, 150));
     }
 
     if (!this.isVoiceRecognitionAvailable()) {
       const error = new Error('语音识别在当前环境下不可用');
-      if (this.errorCallback) {
-        this.errorCallback(error);
-      }
+      this.errorCallback?.(error);
       throw error;
     }
 
     try {
-      this.isListening = true;
-      if (this.listeningStateCallback) {
-        this.listeningStateCallback('started');
-      }
-
       if (this.provider === 'capacitor') {
         if (this.isWebEnvironment && this.webSpeechRecognition) {
-          // 为Web Speech API设置事件监听器
-          this.webSpeechRecognition.onend = () => {
-            // 有时Web Speech API会自动停止，需要确保更新状态
-            if (this.isListening) {
-              this.isListening = false;
-              if (this.listeningStateCallback) {
-                this.listeningStateCallback('stopped');
-              }
-            }
-          };
-
-          this.webSpeechRecognition.onerror = (event) => {
-            if (this.isListening) {
-              this.isListening = false;
-              if (this.listeningStateCallback) {
-                this.listeningStateCallback('stopped');
-              }
-            }
-            if (this.errorCallback) {
-              this.errorCallback(new Error(`语音识别错误: ${event.error}`));
-            }
-          };
-
+          this.webRecognitionStarting = true;
           this.webSpeechRecognition.lang = options?.language || 'zh-CN';
           try {
             this.webSpeechRecognition.start();
-          } catch (err) {
-            this.isListening = false;
-            if (this.listeningStateCallback) {
-              this.listeningStateCallback('stopped');
-            }
+          } catch (err: any) {
+            this.webRecognitionStarting = false;
+            if (err?.message?.includes('recognition has already started')) return; // 忽略重复
             throw err;
           }
         } else {
+          this.debugLog('[startRecognition] using Capacitor native start');
+          this.isListening = true;
+          this.listeningStateCallback?.('started');
           await SpeechRecognition.start({
             language: options?.language || 'zh-CN',
             maxResults: options?.maxResults || 5,
@@ -330,23 +301,20 @@ class VoiceRecognitionService {
           });
         }
       } else {
+        this.isListening = true;
+        this.listeningStateCallback?.('started');
         await this.startWhisperRecognition();
       }
     } catch (error) {
       this.isListening = false;
-      if (this.listeningStateCallback) {
-        this.listeningStateCallback('stopped');
-      }
-      if (this.errorCallback) {
-        this.errorCallback(error);
-      }
+      this.webRecognitionStarting = false;
+      this.listeningStateCallback?.('stopped');
+      this.errorCallback?.(error);
       throw error;
     }
   }
 
-  /**
-   * 使用OpenAI Whisper开始语音识别
-   */
+  /** 使用OpenAI Whisper 开始录音并转写 */
   private async startWhisperRecognition(): Promise<void> {
     try {
       // 请求麦克风权限并开始录制
@@ -411,9 +379,7 @@ class VoiceRecognitionService {
     }
   }
 
-  /**
-   * 停止Whisper录音
-   */
+  /** 停止 Whisper 录音 */
   private stopWhisperRecording(): void {
     if (this.recordingTimeoutId) {
       clearTimeout(this.recordingTimeoutId);
@@ -425,9 +391,7 @@ class VoiceRecognitionService {
     }
   }
 
-  /**
-   * 加载Whisper设置
-   */
+  /** 加载 Whisper 相关设置 */
   private async loadWhisperSettings(): Promise<void> {
     try {
       const apiKey = await getStorageItem<string>('whisper_api_key') || '';
@@ -448,17 +412,17 @@ class VoiceRecognitionService {
     }
   }
 
-  /**
-   * 停止语音识别
-   */
+  /** 停止语音识别（任意模式） */
   public async stopRecognition(): Promise<void> {
-    if (!this.isListening) {
+  this.debugLog('[stopRecognition] isListening=', this.isListening, 'starting=', this.webRecognitionStarting, 'webEnv=', this.isWebEnvironment);
+    if (!this.isListening && !this.webRecognitionStarting) {
       return;
     }
 
     try {
       // 先设置状态为false和通知监听器，防止重复调用
       this.isListening = false;
+      this.webRecognitionStarting = false;
       if (this.listeningStateCallback) {
         this.listeningStateCallback('stopped');
       }
@@ -471,6 +435,7 @@ class VoiceRecognitionService {
             // 静默处理错误
           }
         } else {
+          this.debugLog('[stopRecognition] using Capacitor native stop');
           await SpeechRecognition.stop().catch(() => {
             // 静默处理错误
           });
@@ -487,37 +452,27 @@ class VoiceRecognitionService {
     }
   }
 
-  /**
-   * 设置部分结果回调
-   */
+  /** 设置部分结果回调 */
   public setPartialResultsCallback(callback: (text: string) => void): void {
     this.partialResultsCallback = callback;
   }
 
-  /**
-   * 设置监听状态回调
-   */
+  /** 设置监听状态回调 */
   public setListeningStateCallback(callback: (state: 'started' | 'stopped') => void): void {
     this.listeningStateCallback = callback;
   }
 
-  /**
-   * 设置错误回调
-   */
+  /** 设置错误回调 */
   public setErrorCallback(callback: (error: any) => void): void {
     this.errorCallback = callback;
   }
 
-  /**
-   * 获取当前监听状态
-   */
+  /** 是否正在监听 */
   public getIsListening(): boolean {
     return this.isListening;
   }
 
-  /**
-   * 获取支持的语言
-   */
+  /** 获取支持的语言列表 */
   public async getSupportedLanguages(): Promise<string[]> {
     if (this.provider === 'capacitor') {
       // Web环境
@@ -550,9 +505,7 @@ class VoiceRecognitionService {
     }
   }
 
-  /**
-   * 设置OpenAI Whisper录音时长
-   */
+  /** 设置 Whisper 录音时长 */
   public setRecordingDuration(durationMs: number): void {
     this.recordingDuration = durationMs;
   }
